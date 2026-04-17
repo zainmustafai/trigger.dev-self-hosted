@@ -1,0 +1,319 @@
+# =============================================================================
+# Trigger.dev Self-Hosted - Production Docker Compose
+# =============================================================================
+#
+# Usage:
+#   1. Copy .env.example to .env and configure values (or use provided .env)
+#   2. Start:     docker compose up -d
+#   3. Logs:      docker compose logs -f webapp
+#   4. Dashboard: http://localhost:3040
+#   5. Mailpit:   http://localhost:8025
+#   6. Stop:      docker compose down
+#   7. Reset:     docker compose down -v  (WARNING: deletes all data)
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Shared configuration blocks
+# ---------------------------------------------------------------------------
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+    tag: "{{.Name}}"
+
+x-common: &common
+  restart: unless-stopped
+  logging: *default-logging
+  security_opt:
+    - no-new-privileges:true
+
+x-webapp-env: &webapp-env
+  LOGIN_ORIGIN: &trigger-url ${TRIGGER_PROTOCOL:-http}://${TRIGGER_DOMAIN:-localhost:${WEBAPP_HOST_PORT:-3040}}
+  APP_ORIGIN: *trigger-url
+  DEV_OTEL_EXPORTER_OTLP_ENDPOINT: &trigger-otel ${TRIGGER_PROTOCOL:-http}://${TRIGGER_DOMAIN:-localhost:${WEBAPP_HOST_PORT:-3040}}/otel
+  ELECTRIC_ORIGIN: http://electric:3000
+
+x-worker-env: &worker-env
+  PLATFORM_HOST: webapp
+  PLATFORM_WS_PORT: 3030
+  SECURE_CONNECTION: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: *trigger-otel
+
+# ---------------------------------------------------------------------------
+# Persistent volumes
+# ---------------------------------------------------------------------------
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  mailpit-data:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
+networks:
+  trigger-net:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+
+services:
+
+  # =========================================================================
+  # PostgreSQL - Primary database
+  # =========================================================================
+  postgres:
+    <<: *common
+    image: postgres:${POSTGRES_IMAGE_TAG:-16}
+    container_name: trigger-postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data/
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trigger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-trigger}
+    networks:
+      - trigger-net
+    ports:
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${POSTGRES_HOST_PORT:-5433}:5432"
+    command:
+      - -c
+      - wal_level=logical
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trigger} -d ${POSTGRES_DB:-trigger}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.5"
+        reservations:
+          memory: 256M
+
+  # =========================================================================
+  # Redis - Queue and caching
+  # =========================================================================
+  redis:
+    <<: *common
+    image: redis:${REDIS_IMAGE_TAG:-7}
+    container_name: trigger-redis
+    volumes:
+      - redis-data:/data
+    networks:
+      - trigger-net
+    ports:
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${REDIS_HOST_PORT:-6389}:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+
+  # =========================================================================
+  # Electric SQL - Real-time sync engine
+  # =========================================================================
+  electric:
+    <<: *common
+    image: electricsql/electric:${ELECTRIC_IMAGE_TAG:-latest}
+    container_name: trigger-electric
+    environment:
+      DATABASE_URL: "${DATABASE_URL}?sslmode=disable"
+      ELECTRIC_SECRET: ${ELECTRIC_SECRET}
+    networks:
+      - trigger-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${ELECTRIC_HOST_PORT:-3061}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/v1/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+
+  # =========================================================================
+  # Trigger.dev Webapp - Dashboard + API
+  # =========================================================================
+  webapp:
+    <<: *common
+    image: ghcr.io/triggerdotdev/trigger.dev:${TRIGGER_IMAGE_TAG:-v3}
+    container_name: trigger-webapp
+    env_file:
+      - .env
+    environment:
+      <<: *webapp-env
+    ports:
+      - "${WEBAPP_PUBLISH_IP:-127.0.0.1}:${WEBAPP_HOST_PORT:-3040}:3030"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      electric:
+        condition: service_healthy
+    networks:
+      - trigger-net
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3030/healthcheck').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+
+  # =========================================================================
+  # Docker Provider - Manages task container lifecycle
+  # =========================================================================
+  # NOTE: Requires Docker socket access to create/manage task containers.
+  # On Docker Desktop + WSL2, /var/run/docker.sock is mapped automatically.
+  # =========================================================================
+  docker-provider:
+    <<: *common
+    image: ghcr.io/triggerdotdev/provider/docker:${TRIGGER_IMAGE_TAG:-v3}
+    container_name: trigger-docker-provider
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: root
+    networks:
+      - trigger-net
+    depends_on:
+      webapp:
+        condition: service_healthy
+    ports:
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:9021:9020"
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+      PLATFORM_SECRET: ${PROVIDER_SECRET}
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+
+  # =========================================================================
+  # Coordinator - Orchestrates task execution
+  # =========================================================================
+  # NOTE: Requires Docker socket access for container orchestration.
+  # =========================================================================
+  coordinator:
+    <<: *common
+    image: ghcr.io/triggerdotdev/coordinator:${TRIGGER_IMAGE_TAG:-v3}
+    container_name: trigger-coordinator
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    user: root
+    networks:
+      - trigger-net
+    depends_on:
+      webapp:
+        condition: service_healthy
+    ports:
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:9020:9020"
+    env_file:
+      - .env
+    environment:
+      <<: *worker-env
+      PLATFORM_SECRET: ${COORDINATOR_SECRET}
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+
+  # =========================================================================
+  # Mailpit - Local email testing
+  # =========================================================================
+  # Web UI: http://localhost:8025
+  # SMTP:   mailpit:1025 (internal) / localhost:1025 (host)
+  #
+  # All emails sent by Trigger.dev are caught here.
+  # Remove this service when switching to Resend or production SMTP.
+  # =========================================================================
+  mailpit:
+    <<: *common
+    image: axllent/mailpit:latest
+    container_name: trigger-mailpit
+    networks:
+      - trigger-net
+    ports:
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${MAILPIT_UI_PORT:-8025}:8025"
+      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${MAILPIT_SMTP_PORT:-1025}:1025"
+    environment:
+      MP_MAX_MESSAGES: 500
+      MP_DATABASE: /data/mailpit.db
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    volumes:
+      - mailpit-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8025/livez || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+        reservations:
+          memory: 64M
