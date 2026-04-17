@@ -51,8 +51,6 @@ volumes:
     driver: local
   redis-data:
     driver: local
-  mailpit-data:
-    driver: local
 
 # ---------------------------------------------------------------------------
 # Network
@@ -279,41 +277,3 @@ services:
         reservations:
           memory: 256M
 
-  # =========================================================================
-  # Mailpit - Local email testing
-  # =========================================================================
-  # Web UI: http://localhost:8025
-  # SMTP:   mailpit:1025 (internal) / localhost:1025 (host)
-  #
-  # All emails sent by Trigger.dev are caught here.
-  # Remove this service when switching to Resend or production SMTP.
-  # =========================================================================
-  mailpit:
-    <<: *common
-    image: axllent/mailpit:latest
-    container_name: trigger-mailpit
-    networks:
-      - trigger-net
-    ports:
-      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${MAILPIT_UI_PORT:-8025}:8025"
-      - "${DOCKER_PUBLISH_IP:-127.0.0.1}:${MAILPIT_SMTP_PORT:-1025}:1025"
-    environment:
-      MP_MAX_MESSAGES: 500
-      MP_DATABASE: /data/mailpit.db
-      MP_SMTP_AUTH_ACCEPT_ANY: 1
-      MP_SMTP_AUTH_ALLOW_INSECURE: 1
-    volumes:
-      - mailpit-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8025/livez || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
-        reservations:
-          memory: 64M
